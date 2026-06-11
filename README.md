@@ -12,7 +12,7 @@
 ## Что умеет
 
 - 🎥 **Видео и 🎵 аудио (MP3)** — на выбор для YouTube.
-- 🎶 **Музыка из Spotify / Apple Music / Tidal / Deezer / Я.Музыки** — присылаешь ссылку на трек, получаешь MP3 с обложкой и тегами (метаданные → матч на YouTube через spotdl; Я.Музыка — нативно через yt-dlp).
+- 🎶 **Музыка из Spotify / Apple Music / Tidal / Deezer / Я.Музыки** — присылаешь ссылку на трек, получаешь MP3 с обложкой и тегами. Spotify качается напрямую в **320 kbps** через zotify (нужен `credentials.json` + Premium), Apple/Tidal/Deezer — через odesli→YouTube (spotdl), Я.Музыка — нативно через yt-dlp.
 - 🎚️ **Выбор качества** — 1080p / 720p / 480p / 360p.
 - 🧩 **Два движка с фолбэком** — сначала [yt-dlp](https://github.com/yt-dlp/yt-dlp), если не вышло — [Cobalt](https://github.com/imputnet/cobalt). Что-нибудь да вытащит.
 - 📦 **Большие файлы** — свой локальный Telegram Bot API сервер, поэтому отправка не упирается в лимит 50 МБ.

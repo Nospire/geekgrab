@@ -223,3 +223,11 @@ cookies.txt
 cookies.json
 *.tmp
 test.json
+
+# Spotify zotify auth & build wheels
+spotify_credentials.json
+*.whl
+Dockerfile.zotify
+Dockerfile.spotdl
+Dockerfile.music-test
+Dockerfile.ytdlp-update
