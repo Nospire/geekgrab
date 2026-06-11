@@ -17,6 +17,7 @@ from database.storage import stats
 from database.models import Cookie
 from services.tiktok_scraper import download_tiktok_images, fetch_tiktok_metadata
 from services.music import detect_music_service, download_music
+from services.pikabu import is_pikabu, download_pikabu
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -246,6 +247,9 @@ def get_platform(url: str) -> str:
     if music_svc:
         return "music"
 
+    if is_pikabu(url):
+        return "pikabu"
+
     if "youtube.com" in url_lower or "youtu.be" in url_lower:
         return "youtube"
     elif "tiktok.com" in url_lower:
@@ -392,6 +396,9 @@ async def download_media(url: str, is_music: bool = False, video_height: int = N
         if progress_callback:
             await progress_callback("🎵 Музыкальная ссылка — ищу трек...")
         return await download_music(url, DOWNLOADS_DIR, progress_callback=progress_callback)
+
+    if platform == "pikabu":
+        return await download_pikabu(url, DOWNLOADS_DIR, progress_callback=progress_callback)
 
     # Strip query parameters (they often confuse extractors or contain tracking)
     # Exclude platforms that need query params: youtube, instagram, pornhub (viewkey), yandexmusic

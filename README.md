@@ -23,7 +23,7 @@
 
 ## Поддерживаемые платформы
 
-YouTube / YouTube Music · TikTok · Instagram · Twitter/X · Reddit · Facebook · Vimeo · Twitch · Pinterest · VK · Dailymotion · Pornhub · RedGIFs — **и ещё 1800+ сайтов**.
+YouTube / YouTube Music · TikTok · Instagram · Twitter/X · Reddit · Facebook · Vimeo · Twitch · Pinterest · VK · Dailymotion · Pornhub · RedGIFs · Pikabu · Rule34Video — **и ещё 1800+ сайтов**.
 
 ## Стек
 
