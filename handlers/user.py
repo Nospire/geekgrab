@@ -397,7 +397,9 @@ async def handle_url(message: types.Message):
             pass
         
         # User-friendly error messages
-        if "Unsupported URL" in error_msg:
+        if "429" in error_msg or "Too Many Requests" in error_msg:
+            user_error = "⏳ Reddit сейчас лимитит загрузки (rate-limit) и режет ботов — это не про твою ссылку. Попробуй позже 🙏"
+        elif "Unsupported URL" in error_msg:
             user_error = "❌ Эту ссылку я не осилил. Кинь другую 🙏"
         elif "Private video" in error_msg or "Login required" in error_msg:
             user_error = "🔒 Видео приватное или требует логина — мимо."
@@ -511,7 +513,9 @@ async def handle_format_selection(callback: types.CallbackQuery):
             except Exception:
                 pass
             
-            if "No working app info" in error_msg or "tiktok:sound" in error_msg:
+            if "429" in error_msg or "Too Many Requests" in error_msg:
+                user_error = "⏳ Reddit сейчас лимитит загрузки (rate-limit) и режет ботов — это не про твою ссылку. Попробуй позже 🙏"
+            elif "No working app info" in error_msg or "tiktok:sound" in error_msg:
                 user_error = "❌ Ссылки на звук/музыку из TikTok не поддерживаются. Пришли ссылку на само видео 🎥"
             elif "Unsupported URL" in error_msg:
                 user_error = "❌ Эта ссылка не поддерживается."
@@ -620,7 +624,9 @@ async def handle_resolution_selection(callback: types.CallbackQuery):
             error_msg = str(e)
             logging.error(f"Error in video download: {error_msg}")
             
-            if "No working app info" in error_msg or "tiktok:sound" in error_msg:
+            if "429" in error_msg or "Too Many Requests" in error_msg:
+                user_error = "⏳ Reddit сейчас лимитит загрузки (rate-limit) и режет ботов — это не про твою ссылку. Попробуй позже 🙏"
+            elif "No working app info" in error_msg or "tiktok:sound" in error_msg:
                 user_error = "❌ Ссылки на звук/музыку из TikTok не поддерживаются. Пришли ссылку на само видео 🎥"
             elif "Unsupported URL" in error_msg:
                 user_error = "❌ Эта ссылка не поддерживается."
