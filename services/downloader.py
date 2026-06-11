@@ -1,0 +1,987 @@
+import logging
+import os
+import uuid
+import yt_dlp
+import asyncio
+import random
+import aiohttp
+import requests
+import concurrent.futures
+import subprocess
+from pathlib import Path
+from typing import Tuple, Dict, Optional, Callable, Union, List
+from urllib.parse import urlsplit, urlunsplit, quote
+
+from config import DOWNLOADS_DIR, DATA_DIR, COOKIES_CONTENT, USE_COBALT, COBALT_API_URL, SOCKS_PROXY, IS_HEROKU
+from database.storage import stats
+from database.models import Cookie
+from services.tiktok_scraper import download_tiktok_images, fetch_tiktok_metadata
+
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) Gecko/20100101 Firefox/133.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0',
+]
+
+def normalize_url(raw: str) -> str:
+    """Normalize a user-supplied URL to a valid ASCII URI (IRI->URI).
+
+    Strips surrounding whitespace and percent-encodes any non-ASCII characters
+    (e.g. a stray Cyrillic char a user accidentally appended) so the URL can be
+    placed into HTTP headers, which yt-dlp/urllib3 encode as latin-1. Without
+    this, such a URL raises UnicodeEncodeError and crashes *both* the yt-dlp and
+    Cobalt download paths. Already percent-encoded URLs are left untouched.
+    """
+    if not raw:
+        return raw
+    raw = raw.strip()
+    if raw.isascii():
+        return raw
+    try:
+        parts = urlsplit(raw)
+        netloc = parts.netloc
+        host = parts.hostname or ""
+        if host and not host.isascii():
+            try:
+                ascii_host = host.encode("idna").decode("ascii")
+            except Exception:
+                ascii_host = quote(host)
+            netloc = ascii_host
+            if parts.port:
+                netloc = f"{netloc}:{parts.port}"
+            if parts.username:
+                userinfo = parts.username
+                if parts.password:
+                    userinfo += f":{parts.password}"
+                netloc = f"{userinfo}@{netloc}"
+        path = quote(parts.path, safe="/%:@!$&'()*+,;=~-._")
+        query = quote(parts.query, safe="=&%:@!$'()*+,;/?~-._")
+        fragment = quote(parts.fragment, safe="%/?:@!$&'()*+,;=~-._")
+        return urlunsplit((parts.scheme, netloc, path, query, fragment))
+    except Exception as e:
+        logging.warning(f"URL normalization fallback for {raw!r}: {e}")
+        return quote(raw, safe="%/:?#[]@!$&'()*+,;=~-._")
+
+
+def generate_video_thumbnail(video_path: Path, output_path: Path) -> bool:
+    """Generate a high-quality thumbnail from video using ffmpeg."""
+    try:
+        logging.info(f"Generating thumbnail for {video_path.name}")
+        # Take a frame from 1 second in to avoid black start
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", "00:00:01",
+            "-i", str(video_path),
+            "-vframes", "1",
+            "-vf", "scale=w=320:h=320:force_original_aspect_ratio=decrease",
+            "-q:v", "2",
+            str(output_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            logging.warning(f"ffmpeg thumbnail generation failed: {result.stderr}")
+            return False
+        return True
+    except Exception as e:
+        logging.error(f"Error generating thumbnail: {e}")
+        return False
+
+def probe_video_dimensions(video_path: Path) -> Tuple[int, int]:
+    """Probe video dimensions using ffprobe."""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=s=x:p=0",
+            str(video_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            dims = result.stdout.strip().split('x')
+            if len(dims) == 2:
+                return int(dims[0]), int(dims[1])
+    except Exception:
+        pass
+    return 0, 0
+
+# TLS fingerprints для curl-cffi (имитация браузеров)
+# Список реально доступных targets в curl_cffi 0.5.10 (формат из --list-impersonate-targets)
+IMPERSONATE_TARGETS = [
+    'chrome-110',      # Chrome 110
+    'chrome-107',      # Chrome 107
+    'chrome-104',      # Chrome 104
+    'chrome-101',      # Chrome 101
+    'chrome-100',      # Chrome 100
+    'chrome-99',       # Chrome 99
+    'edge-101',        # Edge 101
+    'edge-99',         # Edge 99
+    'safari-15.5',     # Safari 15.5
+    'safari-15.3',     # Safari 15.3
+]
+
+try:
+    from yt_dlp.networking.impersonate import ImpersonateTarget
+except Exception:
+    ImpersonateTarget = None
+
+
+def build_impersonate_target(value: str):
+    if not ImpersonateTarget:
+        return value
+    for method_name in ("from_str", "parse", "from_string"):
+        method = getattr(ImpersonateTarget, method_name, None)
+        if method:
+            try:
+                return method(value)
+            except Exception:
+                continue
+    try:
+        return ImpersonateTarget(value)
+    except Exception:
+        return value
+
+# Import CobaltClient only if USE_COBALT is enabled
+if USE_COBALT and COBALT_API_URL:
+    try:
+        from services.cobalt_client import CobaltClient
+        cobalt_client = CobaltClient()
+        logging.info(f"✅ Cobalt client initialized: {COBALT_API_URL}")
+    except Exception as e:
+        logging.error(f"❌ Failed to initialize Cobalt client: {e}")
+        cobalt_client = None
+
+# Diagnostic: Check curl_cffi availability
+try:
+    import curl_cffi
+    logging.info(f"✅ curl_cffi {curl_cffi.__version__} available for TLS impersonation")
+except ImportError:
+    logging.warning(f"⚠️ curl_cffi not installed - TLS impersonation disabled")
+except Exception as e:
+    logging.error(f"❌ curl_cffi error: {e}")
+else:
+    if not USE_COBALT:
+        logging.info("ℹ️ Cobalt disabled (USE_COBALT=false)")
+    elif not COBALT_API_URL:
+        logging.warning("⚠️ COBALT_API_URL not set")
+
+# === Funny statuses (English) ===
+FUNNY_STATUSES = [
+    "💻 Взламываю Пентагон...",
+    "🛡️ Отбиваюсь от ФБР...",
+    "🍕 Заказываю пиццу серверным крысам...",
+    "🐈 Глажу серверного кота...",
+    "🔥 Прогреваю видеокарту...",
+    "👀 Смотрю видео всем сервером...",
+    "🚀 Готовлюсь к взлёту...",
+    "🧹 Подметаю битики...",
+    "🤔 Размышляю о смысле жизни...",
+    "📦 Упаковываю пиксели...",
+    "📡 Ищу спутники Илона Маска...",
+    "🔌 Засовываю кабель поглубже...",
+    "☕ Пью кофе, жду загрузку...",
+    "🔨 Чиню то, что не сломано...",
+    "🦖 Убегаю от динозавров...",
+    "💿 Протираю диск спиртиком...",
+    "👾 Договариваюсь с рептилоидами...",
+    "🛰️ Перехватываю сигнал со спутника...",
+    "🧠 Качаю видео силой мысли...",
+    "🐹 Бужу хомячков в колесе сервера...",
+    "🪤 Объясняю провайдеру, что всё легально...",
+    "🧲 Притягиваю пиксели магнитом...",
+    "🛸 Беру видосик у инопланетян...",
+    "🦦 Отвлекаю модераторов выдрой...",
+    "🍪 Скармливаю серверу печеньки...",
+    "🙏 Молюсь, чтобы сервер выжил...",
+    "⚙️ Кручу шестерёнки вручную...",
+    "🎩 Достаю видео из шляпы...",
+    "🛠️ Бью по серверу гаечным ключом — помогает...",
+    "🌑 Призываю тёмные силы интернета...",
+]
+
+# === Работа с Cookies ===
+def get_cookies_content() -> str:
+    """Получает актуальные cookies из ENV или БД"""
+    content = ""
+    if COOKIES_CONTENT:
+        content = COOKIES_CONTENT
+    
+    if stats.Session:
+        try:
+            with stats.Session() as session:
+                cookie = session.query(Cookie).order_by(Cookie.updated_at.desc()).first()
+                if cookie:
+                    content = cookie.content
+        except Exception as e:
+            logging.error(f"Error loading cookies from DB: {e}")
+            
+    # Сохраняем локально для yt-dlp (для TikTok)
+    if content:
+        cookie_path = DATA_DIR / "cookies.txt"
+        with open(cookie_path, "w") as f:
+            f.write(content)
+            
+    return content
+
+# Инициализируем куки при старте модуля
+get_cookies_content()
+
+# === Вспомогательные функции ===
+def get_platform(url: str) -> str:
+    """Detect platform from URL."""
+    url_lower = url.lower()
+    
+    if "youtube.com" in url_lower or "youtu.be" in url_lower:
+        return "youtube"
+    elif "tiktok.com" in url_lower:
+        return "tiktok"
+    elif "instagram.com" in url_lower:
+        return "instagram"
+    elif "reddit.com" in url_lower or "redd.it" in url_lower:
+        return "reddit"
+    elif "twitter.com" in url_lower or "x.com" in url_lower or "t.co" in url_lower:
+        return "twitter"
+    elif "facebook.com" in url_lower or "fb.watch" in url_lower or "fb.com" in url_lower:
+        return "facebook"
+    elif "vimeo.com" in url_lower:
+        return "vimeo"
+    elif "twitch.tv" in url_lower:
+        return "twitch"
+    elif "pinterest.com" in url_lower or "pin.it" in url_lower:
+        return "pinterest"
+    elif "vk.com" in url_lower or "vk.ru" in url_lower:
+        return "vk"
+    elif "dailymotion.com" in url_lower or "dai.ly" in url_lower:
+        return "dailymotion"
+    elif "pornhub.com" in url_lower:
+        return "pornhub"
+    elif "https://" in url_lower or "http://" in url_lower:
+        # yt-dlp supports 1800+ sites, try anyway
+        return "video"
+    else:
+        return "unknown"
+
+def is_youtube_music(url: str) -> bool:
+    return "music.youtube.com" in url
+
+def unshorten_reddit_url(url: str, proxy_url: Optional[str]) -> str:
+    if "/comments/" in url:
+        return url
+    if "reddit.com" not in url or "/s/" not in url:
+        return url
+
+    proxies = None
+    if proxy_url:
+        proxy_value = proxy_url.replace("socks5h", "socks5")
+        proxies = {"http": proxy_value, "https": proxy_value}
+
+    headers = {"User-Agent": USER_AGENTS[0]}
+
+    try:
+        response = requests.head(url, proxies=proxies, headers=headers, allow_redirects=True, timeout=10)
+        final_url = response.url
+        if final_url and "/s/" in final_url:
+            response = requests.get(url, proxies=proxies, headers=headers, allow_redirects=True, timeout=10)
+            final_url = response.url
+        if final_url and "?" in final_url:
+            final_url = final_url.split("?")[0]
+        return final_url or url
+    except Exception as e:
+        logging.warning(f"Failed to unshorten Reddit URL: {e}")
+        return url
+
+def _run_ytdlp_extract(ydl_opts: Dict, url: str) -> Tuple[Dict, str]:
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        prepared_name = ydl.prepare_filename(info)
+    return info, prepared_name
+
+def _select_best_downloaded_file(files: List[Path]) -> Path:
+    if not files:
+        raise ValueError("Download failed: file not found")
+
+    video_exts = {".mp4", ".mkv", ".mov", ".webm", ".m4v", ".avi", ".flv", ".ts", ".unknown_video"}
+    candidates = [f for f in files if f.suffix.lower() in video_exts]
+    if not candidates:
+        candidates = files
+
+    def size_or_zero(path: Path) -> int:
+        try:
+            return path.stat().st_size
+        except Exception:
+            return 0
+
+    return max(candidates, key=size_or_zero)
+
+def _cleanup_extra_files(files: List[Path], keep: Path) -> None:
+    for path in files:
+        if path == keep:
+            continue
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+
+# === Основная логика ===
+
+async def download_media(url: str, is_music: bool = False, video_height: int = None, progress_callback: Optional[Callable] = None) -> Tuple[Union[Path, List[Path]], Optional[Path], Dict]:
+    logging.info(f"Using yt-dlp version: {yt_dlp.version.__version__}")
+
+    # Normalize the incoming URL (IRI->URI) so stray non-ASCII chars don't crash
+    # yt-dlp/Cobalt with a latin-1 header encoding error.
+    url = normalize_url(url)
+
+    async def maybe_add_instagram_audio(files: List[Path]) -> List[Path]:
+        if not cobalt_client:
+            return files
+        try:
+            audio_path, _, _ = await cobalt_client.download_media(
+                url=url,
+                quality="1080",
+                is_audio=True,
+                progress_callback=progress_callback
+            )
+            if audio_path:
+                if isinstance(audio_path, list):
+                    return files + audio_path
+                return files + [audio_path]
+        except Exception as audio_error:
+            logging.error(f"[COBALT] ❌ Error (Instagram audio): {audio_error}")
+        return files
+    
+    # Resolve short URLs to detect slideshows and help yt-dlp
+    if "vm.tiktok.com" in url or "vt.tiktok.com" in url or "/t/" in url:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.head(url, allow_redirects=True, timeout=5) as resp:
+                    url = str(resp.url)
+        except Exception as e:
+            logging.warning(f"Failed to resolve TikTok URL: {e}")
+    
+    # Resolve Reddit short URLs (reddit.com/r/.../s/...) to full URLs using proxy
+    if "reddit.com" in url and "/s/" in url:
+        try:
+            resolved_url = await asyncio.to_thread(unshorten_reddit_url, url, SOCKS_PROXY)
+            if resolved_url != url:
+                logging.info(f"✅ Resolved Reddit URL to: {resolved_url}")
+            url = resolved_url
+        except Exception as e:
+            logging.warning(f"Failed to resolve Reddit short URL via proxy: {e}")
+
+    platform = get_platform(url)
+
+    # Strip query parameters (they often confuse extractors or contain tracking)
+    # Exclude platforms that need query params: youtube, instagram, pornhub (viewkey)
+    if '?' in url and platform not in ("youtube", "instagram", "pornhub"):
+        url = url.split('?')[0]
+    
+    # Показываем смешной статус сразу
+    if progress_callback:
+        funny_status = random.choice(FUNNY_STATUSES)
+        await progress_callback(f"🎬 {funny_status}")
+
+    # Prefer Cobalt on Heroku for Reddit (yt-dlp impersonate fails on Heroku)
+    if platform == "reddit" and IS_HEROKU and cobalt_client:
+        try:
+            logging.info(f"[COBALT] Heroku-first attempt for Reddit: {url}")
+            file_path, thumb_path, metadata = await cobalt_client.download_media(
+                url=url,
+                quality="1080",
+                is_audio=is_music,
+                progress_callback=progress_callback
+            )
+            if file_path:
+                    if isinstance(file_path, list):
+                        logging.info(f"[COBALT] ✅ Success: {len(file_path)} files")
+                        return file_path, thumb_path, metadata
+                    elif file_path.exists():
+                        logging.info(f"[COBALT] ✅ Success: {file_path.name}")
+                        return file_path, thumb_path, metadata
+            logging.warning("[COBALT] ⚠️ No file returned")
+        except Exception as cobalt_error:
+            logging.error(f"[COBALT] ❌ Error (Heroku-first): {cobalt_error}")
+
+    # Prefer Cobalt for Instagram photos when available
+    if platform == "instagram" and cobalt_client and not is_music:
+        try:
+            logging.info(f"[COBALT] Instagram-first attempt: {url}")
+            file_path, thumb_path, metadata = await cobalt_client.download_media(
+                url=url,
+                quality="1080",
+                is_audio=is_music,
+                progress_callback=progress_callback
+            )
+            if file_path:
+                if isinstance(file_path, list):
+                    logging.info(f"[COBALT] ✅ Success: {len(file_path)} files")
+                    file_path = await maybe_add_instagram_audio(file_path)
+                    return file_path, thumb_path, metadata
+                if file_path.exists():
+                    logging.info(f"[COBALT] ✅ Success: {file_path.name}")
+                    return file_path, thumb_path, metadata
+            logging.warning("[COBALT] ⚠️ No file returned")
+        except Exception as cobalt_error:
+            logging.error(f"[COBALT] ❌ Error (Instagram-first): {cobalt_error}")
+    
+    # === МЕТОД 1: YT-DLP (основной) ===
+    ytdlp_error = None
+    try:
+        logging.info(f"[YT-DLP] Attempting download: {url}")
+        
+        # TikTok через специальный метод
+        if platform == "tiktok":
+            # Always use tiktok_local first, and then enrich
+            res = await _download_local_tiktok(url)
+            # Enrich metadata with verification for TikTok ALWAYS
+            if res and len(res) == 3:
+                files, thumb, meta = res
+                
+                # Post-process for thumbnails and dimensions if needed
+                if isinstance(files, Path) and files.exists():
+                    video_file = files
+                    # Always generate thumbnail if missing
+                    if not thumb or not thumb.exists():
+                        new_thumb = DOWNLOADS_DIR / f"{video_file.stem}_thumb.jpg"
+                        if generate_video_thumbnail(video_file, new_thumb):
+                            thumb = new_thumb
+                            res = (video_file, thumb, meta)
+                    
+                    # Ensure dimensions are present
+                    if not meta.get('width') or not meta.get('height'):
+                        w, h = probe_video_dimensions(video_file)
+                        if w > 0:
+                            meta['width'] = w
+                            meta['height'] = h
+
+                if not meta.get('verified'):
+                    try:
+                        if platform == "tiktok":
+                            from services.tiktok_scraper import fetch_tiktok_metadata
+                            enrich_meta = await asyncio.to_thread(fetch_tiktok_metadata, url)
+                            if enrich_meta.get('verified'):
+                                meta['verified'] = True
+                                logging.info(f"✅ Verified status enriched for {url}")
+                        elif platform == "instagram":
+                            # Use a separate probe for Instagram verification
+                            ydl_opts_probe = {
+                                'proxy': '',
+                                'quiet': True,
+                                'no_warnings': True,
+                                'cookiefile': str(DATA_DIR / "cookies.txt"),
+                            }
+                            with yt_dlp.YoutubeDL(ydl_opts_probe) as ydl:
+                                info = ydl.extract_info(url, download=False)
+                                meta['verified'] = info.get('uploader_is_verified') or False
+                                if info.get('uploader') and (not meta.get('uploader') or meta.get('uploader') == 'Unknown'):
+                                    meta['uploader'] = info['uploader']
+                                    logging.info(f"✅ Instagram uploader enriched: {meta['uploader']}")
+                            if meta.get('verified'):
+                                logging.info(f"✅ Instagram Verified status enriched for {url}")
+                    except Exception as e:
+                        logging.warning(f"Failed to enrich verification for {platform}: {e}")
+            return res
+        
+        # YouTube/Instagram/музыка через универсальный метод
+        return await _download_local_ytdlp(url, is_music, video_height=video_height)
+        
+    except Exception as e:
+        ytdlp_error = str(e)
+        logging.warning(f"[YT-DLP] ❌ Failed: {ytdlp_error}")
+    
+    # If Instagram photo-only post, go straight to Cobalt fallback
+    if platform == "instagram" and cobalt_client and ytdlp_error and "There is no video in this post" in ytdlp_error:
+        try:
+            logging.info(f"[COBALT] Instagram fallback after photo-only error: {url}")
+            file_path, thumb_path, metadata = await cobalt_client.download_media(
+                url=url,
+                quality="1080",
+                is_audio=is_music,
+                progress_callback=progress_callback
+            )
+            if file_path:
+                if isinstance(file_path, list):
+                    logging.info(f"[COBALT] ✅ Success: {len(file_path)} files")
+                    file_path = await maybe_add_instagram_audio(file_path)
+                    return file_path, thumb_path, metadata
+                if file_path.exists():
+                    logging.info(f"[COBALT] ✅ Success: {file_path.name}")
+                    return file_path, thumb_path, metadata
+            logging.warning("[COBALT] ⚠️ No file returned")
+        except Exception as cobalt_error:
+            logging.error(f"[COBALT] ❌ Error (Instagram-photo fallback): {cobalt_error}")
+
+    # === МЕТОД 1.5: YT-DLP С ПРОКСИ (fallback если есть прокси) ===
+    if SOCKS_PROXY and ytdlp_error:
+        try:
+            logging.info(f"[YT-DLP+PROXY] Attempting with SOCKS proxy")
+            
+            # TikTok через специальный метод с прокси
+            if platform == "tiktok":
+                return await _download_local_tiktok(url, use_proxy=True)
+            
+            # YouTube/Instagram/музыка с прокси
+            return await _download_local_ytdlp(url, is_music, video_height=video_height, use_proxy=True)
+            
+        except Exception as proxy_error:
+            logging.warning(f"[YT-DLP+PROXY] ❌ Failed: {proxy_error}")
+            # Silent fallback to method 2 (Cobalt)
+    
+    # === МЕТОД 2: COBALT API (fallback) ===
+    if cobalt_client:
+        try:
+            logging.info(f"[COBALT] Attempting download: {url}")
+            file_path, thumb_path, metadata = await cobalt_client.download_media(
+                url=url,
+                quality="1080",
+                is_audio=is_music,
+                progress_callback=progress_callback
+            )
+            if file_path:
+                if isinstance(file_path, list):
+                    logging.info(f"[COBALT] ✅ Success: {len(file_path)} files")
+                    return file_path, thumb_path, metadata
+                if file_path.exists():
+                    logging.info(f"[COBALT] ✅ Success: {file_path.name}")
+                    return file_path, thumb_path, metadata
+            else:
+                logging.warning("[COBALT] ⚠️ No file returned")
+        except Exception as cobalt_error:
+            logging.error(f"[COBALT] ❌ Error: {cobalt_error}")
+    
+    # === МЕТОД 3: TIKWM (только для TikTok) ===
+    if platform == "tiktok":
+        try:
+            logging.info("[TIKWM] Attempting download...")
+            return await _download_tiktok_tikwm(url)
+        except Exception as tikwm_error:
+            logging.error(f"[TIKWM] ❌ Failed: {tikwm_error}")
+    
+    # Все методы провалились
+    raise Exception(f"All download methods failed. YT-DLP error: {ytdlp_error}")
+
+
+async def _download_local_ytdlp(url: str, is_music: bool = False, video_height: int = None, use_proxy: bool = False) -> Tuple[Path, Optional[Path], Dict]:
+    """Универсальный метод для YouTube/Instagram/музыки через yt-dlp с retry на 403"""
+    unique_id = uuid.uuid4().hex[:8]
+    output_template = str(DOWNLOADS_DIR / f"%(title)s_%(id)s_{unique_id}.%(ext)s")
+    cookie_file = DATA_DIR / "cookies.txt"
+
+    is_reddit = "reddit.com" in url or "redd.it" in url
+    is_youtube = "youtube.com" in url or "youtu.be" in url
+    is_instagram = "instagram.com" in url
+    
+    # Try multiple user-agents if we get 403
+    last_error = None
+    for attempt, user_agent in enumerate(USER_AGENTS, 1):
+        # First try with impersonate, fallback to without if it fails
+        impersonate_modes = [True, False]
+        if is_reddit and IS_HEROKU:
+            # Avoid yt-dlp impersonate on Heroku (AssertionError from ImpersonateTarget)
+            impersonate_modes = [False]
+        for use_impersonate in impersonate_modes:
+            try:
+                impersonate_target = IMPERSONATE_TARGETS[(attempt - 1) % len(IMPERSONATE_TARGETS)]
+                
+                ydl_opts = {
+                    'outtmpl': output_template,
+                    'cookiefile': str(cookie_file) if cookie_file.exists() and cookie_file.is_file() and cookie_file.stat().st_size > 0 else None,
+                    'noplaylist': True,
+                    'quiet': False,
+                    'verbose': True,
+                    'legacy_server_connect': True,  # GitHub: helps with old TLS configs & Cloudflare
+                    'socket_timeout': 30,  # Prevent hanging on slow/blocked connections
+                    'retries': 3,  # Retry failed fragments
+                    'fragment_retries': 3,  # Retry failed fragments
+                    'playlist_items': '1',  # Only download first item if URL is a playlist
+                    'noplaylist': True,  # Skip playlists
+                    'exec_before_download': [],  # Prevent PhantomJS usage
+                    'extractor_args': {
+                        'pornhub': {
+                            'no_js': True  # Try without JS first
+                        }
+                    },
+                    'js_runtimes': {
+                        'node': {'path': '/usr/local/bin/node'}
+                    },
+                    'remote_components': ['ejs:github']
+                }
+                
+                # Расширенные HTTP-заголовки для имитации браузера
+                browser_headers = {
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
+                    'Cache-Control': 'max-age=0',
+                    'Sec-Ch-Ua': '"Chromium";v="120", "Google Chrome";v="120", "Not_A Brand";v="24"',
+                    'Sec-Ch-Ua-Mobile': '?0',
+                    'Sec-Ch-Ua-Platform': '"Windows"',
+                    'Sec-Fetch-Dest': 'document',
+                    'Sec-Fetch-Mode': 'navigate',
+                    'Sec-Fetch-Site': 'none',
+                    'Sec-Fetch-User': '?1',
+                    'Upgrade-Insecure-Requests': '1',
+                    'User-Agent': user_agent,
+                }
+                ydl_opts['http_headers'] = browser_headers
+                
+                # Имитация TLS-отпечатка браузера через curl-cffi (если поддерживается)
+                if use_impersonate:
+                    try:
+                        target_obj = build_impersonate_target(impersonate_target)
+                        if ImpersonateTarget and not isinstance(target_obj, ImpersonateTarget):
+                            logging.warning(
+                                f"⚠️ Impersonate target not supported on this runtime: {impersonate_target}"
+                            )
+                            use_impersonate = False
+                        else:
+                            ydl_opts['impersonate'] = target_obj
+                            logging.info(f"🔒 Attempting TLS impersonation: {impersonate_target} + User-Agent: {user_agent[:50]}...")
+                    except Exception as imp_err:
+                        logging.error(f"❌ Failed to set impersonate={impersonate_target}: {imp_err}")
+                        # Don't retry with impersonate if setting fails
+                        use_impersonate = False
+                
+                # Reddit-specific configuration to avoid blocks
+                if "reddit.com" in url or "redd.it" in url:
+                    ydl_opts['extractor_args'] = {
+                        'reddit': {
+                            'user_agent': user_agent
+                        }
+                    }
+
+                if is_instagram:
+                    ydl_opts['noplaylist'] = False
+                    ydl_opts['extractor_args'] = {
+                        'instagram': {
+                            'include_videos': True,
+                            'include_pictures': True,
+                        }
+                    }
+                
+                # Добавляем или ПРИНУДИТЕЛЬНО ОТКЛЮЧАЕМ прокси
+                if use_proxy and SOCKS_PROXY:
+                    ydl_opts['proxy'] = SOCKS_PROXY
+                else:
+                    # Принудительно отключаем прокси (пустая строка перебивает ENV переменные)
+                    ydl_opts['proxy'] = ''
+                
+                if is_music:
+                    # Только аудио
+                    ydl_opts['format'] = 'bestaudio/best'
+                    ydl_opts['postprocessors'] = [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '320',
+                    }]
+                else:
+                    if is_reddit:
+                        # Reddit uses DASH/HLS with separate video+audio streams
+                        ydl_opts['merge_output_format'] = 'mp4'
+                        if video_height:
+                            ydl_opts['format'] = f"bestvideo[height<={video_height}]+bestaudio/bestvideo+bestaudio/best"
+                        else:
+                            ydl_opts['format'] = 'bestvideo+bestaudio/best'
+                    elif video_height:
+                        ydl_opts['format'] = f"best[height={video_height}]/best[height<={video_height}]/best"
+                    else:
+                        # Видео с H.264 кодеком
+                        ydl_opts['format'] = 'best[vcodec^=h264]/best[vcodec^=avc]/best'
+                
+                try:
+                    info, prepared_name = await asyncio.to_thread(_run_ytdlp_extract, ydl_opts, url)
+                except Exception as extract_error:
+                    error_text = str(extract_error)
+                    if "Requested format is not available" in error_text:
+                        ydl_opts['format'] = 'best'
+                        ydl_opts.pop('merge_output_format', None)
+                        info, prepared_name = await asyncio.to_thread(_run_ytdlp_extract, ydl_opts, url)
+                    else:
+                        raise
+
+                metadata = {
+                    'title': info.get('title', 'Media'),
+                    'uploader': info.get('uploader', 'Unknown'),
+                    'webpage_url': info.get('webpage_url', url),
+                    'duration': info.get('duration', 0),
+                    'width': info.get('width', 0),
+                    'height': info.get('height', 0),
+                    'verified': info.get('creator_is_verified') or info.get('uploader_is_verified') or info.get('verified') or False,
+                }
+
+                # Находим скачанный файл
+                downloaded_files = list(DOWNLOADS_DIR.glob(f"*{unique_id}*"))
+
+                if not downloaded_files:
+                    path = Path(prepared_name)
+                    if path.exists():
+                        downloaded_files = [path]
+                    else:
+                        raise ValueError("Download failed: file not found")
+
+                if is_instagram and info.get("entries"):
+                    downloaded_files.sort(key=lambda p: p.name)
+                    return downloaded_files, None, metadata
+
+                file_path = _select_best_downloaded_file(downloaded_files)
+                _cleanup_extra_files(downloaded_files, file_path)
+                logging.info(f"Downloaded: {file_path.name}")
+                
+                # Generate thumbnail if missing and mandatory probe for dimensions
+                final_thumbnail = None
+                if not is_music:
+                    if not metadata.get('width') or not metadata.get('height'):
+                        w, h = probe_video_dimensions(file_path)
+                        metadata['width'] = w
+                        metadata['height'] = h
+                    
+                    thumbnail_path = DOWNLOADS_DIR / f"{file_path.stem}_thumb.jpg"
+                    if generate_video_thumbnail(file_path, thumbnail_path):
+                        final_thumbnail = thumbnail_path
+
+                if use_impersonate and attempt > 1:
+                    logging.info(f"✅ Success with user-agent {attempt}/{len(USER_AGENTS)} + impersonate={impersonate_target}")
+                elif not use_impersonate:
+                    logging.info(f"✅ Success without impersonate (attempt {attempt}/{len(USER_AGENTS)})")
+
+                return file_path, final_thumbnail, metadata
+                    
+            except Exception as e:
+                error_str = str(e)
+                error_type = type(e).__name__
+                
+                # Detailed diagnostics for AssertionError (curl_cffi issue)
+                if isinstance(e, AssertionError):
+                    import traceback
+                    tb_lines = traceback.format_exception(type(e), e, e.__traceback__)
+                    tb_str = ''.join(tb_lines[-5:])  # Last 5 lines
+                    logging.error(f"❌ AssertionError in yt-dlp (curl_cffi failure):")
+                    logging.error(f"   Target: {impersonate_target if use_impersonate else 'none'}")
+                    logging.error(f"   Message: {error_str if error_str else '(empty)'}")
+                    logging.error(f"   Traceback (last 5 lines):\n{tb_str}")
+                
+                # If impersonate failed, try without it
+                if use_impersonate and (not error_str or "impersonate" in error_str.lower() or error_type == "AssertionError"):
+                    logging.warning(f"⚠️ Impersonate failed ({error_type}): {error_str[:100] if error_str else 'empty'}")
+                    logging.info(f"Retrying attempt {attempt} without TLS impersonation...")
+                    continue
+                
+                # Check if it's a 403 error
+                if "403" in error_str or "Blocked" in error_str or "Forbidden" in error_str:
+                    logging.warning(f"Attempt {attempt}/{len(USER_AGENTS)} failed with 403: {error_str[:150]}")
+                    last_error = e
+                    if attempt < len(USER_AGENTS):
+                        logging.info(f"Retrying with different user-agent...")
+                        break  # Break inner loop, continue outer loop
+                    
+                # If not 403, raise immediately
+                logging.error(f"YT-DLP error: {error_str[:200]}")
+                raise e
+    
+    # All attempts failed with 403
+    raise last_error if last_error else Exception("All user-agent attempts failed")
+
+
+async def _download_local_tiktok(url: str, use_proxy: bool = False) -> Tuple[Union[Path, List[Path]], Optional[Path], Dict]:
+    """Скачивание TikTok на VPS. Поддерживает видео (h264) и фото-слайдшоу."""
+    
+    unique_id = uuid.uuid4().hex[:8]
+    output_template = str(DOWNLOADS_DIR / f"%(title)s_%(id)s_{unique_id}.%(ext)s")
+    cookie_file = DATA_DIR / "cookies.txt"
+    
+    # Check for slideshow (images)
+    is_slideshow = "/photo/" in url
+    
+    ydl_opts_base = {
+        'outtmpl': output_template,
+        'cookiefile': str(cookie_file) if cookie_file.exists() and cookie_file.is_file() and cookie_file.stat().st_size > 0 else None,
+        'noplaylist': True,
+        'quiet': False,
+        'verbose': True,
+        'http_headers': {
+            'User-Agent': random.choice(USER_AGENTS),
+        },
+        'extractor_args': {
+            'tiktok': {
+                'app_name': ['tiktok_web'],
+                'app_version': [''],
+            }
+        },
+        # Не указываем target явно — yt-dlp сам выберет доступный на ARM64
+    }
+    
+    # Добавляем или ПРИНУДИТЕЛЬНО ОТКЛЮЧАЕМ прокси
+    if use_proxy and SOCKS_PROXY:
+        ydl_opts_base['proxy'] = SOCKS_PROXY
+    else:
+        # Принудительно отключаем прокси (пустая строка перебивает ENV переменные)
+        ydl_opts_base['proxy'] = ''
+    
+    if is_slideshow:
+        # Try custom scraper first for photos (as yt-dlp might fail or be slow)
+        try:
+             logging.info("Attempting to download slideshow with custom scraper...")
+             loop = asyncio.get_event_loop()
+             # Run sync scraper in executor
+             files, meta = await loop.run_in_executor(None, download_tiktok_images, url, DOWNLOADS_DIR)
+             return files, None, meta
+        except Exception as e:
+             logging.error(f"Custom scraper failed: {e}. Falling back to yt-dlp...")
+             ydl_opts = ydl_opts_base.copy()
+    else:
+        # Strict legacy codec check for videos
+        ydl_opts = ydl_opts_base.copy()
+        ydl_opts['format'] = 'best[vcodec^=h264]/best[vcodec^=avc]'
+
+    info, prepared_name = await asyncio.to_thread(_run_ytdlp_extract, ydl_opts, url)
+
+    metadata = {
+        'title': info.get('title', 'TikTok Media'),
+        'uploader': info.get('uploader', 'Unknown'),
+        'webpage_url': info.get('webpage_url', url),
+        'duration': info.get('duration', 0),
+        'width': info.get('width', 0),
+        'height': info.get('height', 0),
+        'verified': info.get('creator_is_verified') or info.get('uploader_is_verified') or info.get('verified') or False,
+    }
+
+    # Determine downloaded files
+    # We search by unique_id to catch all files (images, mp3, mp4)
+    downloaded_files = list(DOWNLOADS_DIR.glob(f"*{unique_id}*"))
+
+    if not downloaded_files:
+        # Fallback to prepare_filename
+        path = Path(prepared_name)
+        if path.exists():
+            downloaded_files = [path]
+        else:
+             raise ValueError("Download failed: file not found")
+
+    if is_slideshow:
+        return downloaded_files, None, metadata
+    
+    # Video handling - проверяем кодек, только H264 разрешён для yt-dlp
+    video_files = [f for f in downloaded_files if f.suffix in ['.mp4', '.mov']]
+    if video_files:
+        path = _select_best_downloaded_file(video_files)
+        vcodec = info.get('vcodec', 'unknown')
+        if vcodec: vcodec = vcodec.lower()
+        
+        # Только H264/AVC допустимы для локального yt-dlp
+        is_h264 = 'avc' in vcodec or 'h264' in vcodec
+        if not is_h264 and 'unknown' not in vcodec:
+            # Удаляем файл и бросаем исключение для fallback на tikwm
+            for f in downloaded_files:
+                if f.exists(): f.unlink()
+            raise ValueError(f"Codec {vcodec} not H264, trying tikwm fallback")
+        
+        return path, None, metadata
+        
+    selected_path = _select_best_downloaded_file(downloaded_files)
+    _cleanup_extra_files(downloaded_files, selected_path)
+    return selected_path, None, metadata
+
+
+async def _download_tiktok_tikwm(url: str) -> Tuple[Path, Optional[Path], Dict]:
+    """Fallback: download TikTok video using tikwm.com API when yt-dlp fails"""
+    import requests
+    import subprocess
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json, text/plain, */*',
+    }
+    
+    api_url = 'https://www.tikwm.com/api/'
+    params = {'url': url, 'hd': 1}
+    
+    response = requests.get(api_url, params=params, headers=headers, timeout=15)
+    
+    if response.status_code != 200:
+        raise Exception(f"tikwm API returned status {response.status_code}")
+    
+    data = response.json()
+    
+    if data.get('code') != 0:
+        raise Exception(f"tikwm API error: {data.get('msg', 'Unknown error')}")
+    
+    result = data.get('data', {})
+    
+    # Get video URL (prefer HD, but tikwm may not have h264)
+    video_url = result.get('hdplay') or result.get('play')
+    
+    if not video_url:
+        raise Exception("No video URL found in tikwm response")
+    
+    # Get thumbnail URL
+    thumbnail_url = result.get('origin_cover') or result.get('cover')
+    
+    # Extract metadata
+    author = result.get('author', {}).get('unique_id', 'Unknown')
+    title = result.get('title', 'TikTok Video')
+    duration = result.get('duration', 0)
+    
+    logging.info(f"tikwm: Downloading video from {video_url[:80]}...")
+    
+    # Download video
+    unique_id = uuid.uuid4().hex[:8]
+    video_path = DOWNLOADS_DIR / f"tiktok_{unique_id}.mp4"
+    
+    video_response = requests.get(video_url, headers={'User-Agent': headers['User-Agent']}, stream=True, timeout=30)
+    
+    if video_response.status_code != 200:
+        raise Exception(f"Failed to download video: status {video_response.status_code}")
+    
+    with open(video_path, 'wb') as f:
+        for chunk in video_response.iter_content(chunk_size=8192):
+            f.write(chunk)
+    
+    logging.info(f"tikwm: Video downloaded successfully to {video_path}")
+    
+    # Download thumbnail if available
+    thumbnail_path = None
+    if thumbnail_url:
+        try:
+            thumbnail_path = DOWNLOADS_DIR / f"tiktok_{unique_id}.jpg"
+            thumb_response = requests.get(thumbnail_url, headers={'User-Agent': headers['User-Agent']}, timeout=10)
+            
+            if thumb_response.status_code == 200:
+                with open(thumbnail_path, 'wb') as f:
+                    f.write(thumb_response.content)
+                logging.info(f"tikwm: Thumbnail downloaded to {thumbnail_path}")
+            else:
+                thumbnail_path = None
+        except Exception as e:
+            logging.warning(f"tikwm: Failed to download thumbnail: {e}")
+            thumbnail_path = None
+    
+    # Не проверяем кодек - принимаем любой формат (H264 или HEVC)
+    # Если Telegram не поддержит HEVC, пользователь увидит ошибку и попробует снова
+    
+    # Enrich metadata with verification status (requires extra API call)
+    verified = False
+    try:
+        temp_meta = await asyncio.to_thread(fetch_tiktok_metadata, url)
+        verified = temp_meta.get('verified', False)
+        # Use uploader from fetch_tiktok_metadata if tikwm main API missed it
+        if (not author or author == 'Unknown') and temp_meta.get('uploader'):
+            author = temp_meta['uploader']
+    except Exception as e:
+        logging.warning(f"Failed to fetch verification status in _download_tiktok_tikwm: {e}")
+
+    metadata = {
+        'title': title,
+        'uploader': author,
+        'webpage_url': url,
+        'duration': duration,
+        'verified': verified,
+        'ext': 'mp4'
+    }
+    
+    return video_path, thumbnail_path, metadata
