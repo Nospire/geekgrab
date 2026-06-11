@@ -16,6 +16,7 @@ from config import DOWNLOADS_DIR, DATA_DIR, COOKIES_CONTENT, USE_COBALT, COBALT_
 from database.storage import stats
 from database.models import Cookie
 from services.tiktok_scraper import download_tiktok_images, fetch_tiktok_metadata
+from services.music import detect_music_service, download_music
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -236,7 +237,15 @@ get_cookies_content()
 def get_platform(url: str) -> str:
     """Detect platform from URL."""
     url_lower = url.lower()
-    
+
+    # Музыкальные сервисы: Spotify/Apple/Tidal/Deezer → spotdl-модуль ("music"),
+    # Я.Музыка → нативный экстрактор yt-dlp ("yandexmusic", идёт в аудио-ветку).
+    music_svc = detect_music_service(url)
+    if music_svc == "yandex":
+        return "yandexmusic"
+    if music_svc:
+        return "music"
+
     if "youtube.com" in url_lower or "youtu.be" in url_lower:
         return "youtube"
     elif "tiktok.com" in url_lower:
@@ -377,9 +386,16 @@ async def download_media(url: str, is_music: bool = False, video_height: int = N
 
     platform = get_platform(url)
 
+    # Музыкальные сервисы (Spotify/Apple/Tidal/Deezer) — отдельный модуль через spotdl.
+    # Перехватываем ДО обрезки query (Apple использует ?i=<track>) и до видео-статуса.
+    if platform == "music":
+        if progress_callback:
+            await progress_callback("🎵 Музыкальная ссылка — ищу трек...")
+        return await download_music(url, DOWNLOADS_DIR, progress_callback=progress_callback)
+
     # Strip query parameters (they often confuse extractors or contain tracking)
-    # Exclude platforms that need query params: youtube, instagram, pornhub (viewkey)
-    if '?' in url and platform not in ("youtube", "instagram", "pornhub"):
+    # Exclude platforms that need query params: youtube, instagram, pornhub (viewkey), yandexmusic
+    if '?' in url and platform not in ("youtube", "instagram", "pornhub", "yandexmusic"):
         url = url.split('?')[0]
     
     # Показываем смешной статус сразу

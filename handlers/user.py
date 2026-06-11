@@ -168,6 +168,8 @@ async def cmd_start(message: types.Message):
         "• Pinterest\n"
         "• VK / Dailymotion\n"
         "• и ещё 1800+ сайтов!\n\n"
+        "🎶 А ещё музыка: Spotify, Apple Music, Tidal, Deezer, Я.Музыка —\n"
+        "пришли ссылку на трек, верну MP3 с обложкой и тегами.\n\n"
         "Просто пришли ссылку и наблюдай за магией ✨"
     )
 
@@ -222,7 +224,7 @@ async def handle_url(message: types.Message):
             except Exception:
                 pass
         
-        is_music = is_youtube_music(message.text)
+        is_music = is_youtube_music(message.text) or platform in ("music", "yandexmusic")
         file_path, thumbnail_path, metadata = await download_media(message.text, is_music, progress_callback=update_status)
 
         # Determine title based on file_path type
@@ -251,7 +253,7 @@ async def handle_url(message: types.Message):
         )
 
         if isinstance(file_path, list):
-            await update_status("📤 Uploading slideshow to Telegram...")
+            await update_status("📤 Заливаю слайдшоу в Telegram...")
             
             # Separate media types
             image_exts = ['.jpg', '.jpeg', '.png', '.webp']
@@ -311,7 +313,7 @@ async def handle_url(message: types.Message):
             await status_message.delete()
 
         elif file_path.exists():
-            await update_status("📤 Uploading to Telegram...")
+            await update_status("📤 Заливаю в Telegram...")
             
             # Use unified caption format
             caption = format_caption(metadata, platform, message.text)
@@ -469,7 +471,7 @@ async def handle_format_selection(callback: types.CallbackQuery):
             )
 
             if file_path.exists():
-                await update_status("📤 Uploading to Telegram...")
+                await update_status("📤 Заливаю в Telegram...")
                 
                 caption = format_caption(metadata, 'youtube', url)
 
@@ -575,7 +577,7 @@ async def handle_resolution_selection(callback: types.CallbackQuery):
             )
 
             if file_path.exists():
-                await update_status("📤 Uploading to Telegram...")
+                await update_status("📤 Заливаю в Telegram...")
                 
                 caption = format_caption(metadata, 'youtube', url)
 
