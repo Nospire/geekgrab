@@ -619,9 +619,11 @@ async def _download_local_ytdlp(url: str, is_music: bool = False, video_height: 
                     'quiet': False,
                     'verbose': True,
                     'legacy_server_connect': True,  # GitHub: helps with old TLS configs & Cloudflare
+                    'source_address': '0.0.0.0',  # Форсим IPv4: у хоста нет IPv6-выхода, AAAA-адреса мертвы
                     'socket_timeout': 30,  # Prevent hanging on slow/blocked connections
-                    'retries': 3,  # Retry failed fragments
-                    'fragment_retries': 3,  # Retry failed fragments
+                    'retries': 10,  # Больше ретраев — egress-DNS периодически флапает (could not resolve)
+                    'fragment_retries': 10,
+                    'extractor_retries': 5,  # Ретраим и фазу извлечения метаданных
                     'playlist_items': '1',  # Only download first item if URL is a playlist
                     'noplaylist': True,  # Skip playlists
                     'exec_before_download': [],  # Prevent PhantomJS usage
@@ -827,6 +829,11 @@ async def _download_local_tiktok(url: str, use_proxy: bool = False) -> Tuple[Uni
         'noplaylist': True,
         'quiet': False,
         'verbose': True,
+        'source_address': '0.0.0.0',  # Форсим IPv4: нет IPv6-выхода у хоста
+        'socket_timeout': 30,
+        'retries': 10,
+        'fragment_retries': 10,
+        'extractor_retries': 5,
         'http_headers': {
             'User-Agent': random.choice(USER_AGENTS),
         },
