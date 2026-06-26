@@ -689,7 +689,21 @@ async def _download_local_ytdlp(url: str, is_music: bool = False, video_height: 
                             'include_pictures': True,
                         }
                     }
-                
+
+                if is_youtube:
+                    # У хоста нет поддерживаемого JS-рантайма (node у yt-dlp = unsupported,
+                    # deno/bun нет), поэтому web/tv-клиенты ломаются на расшифровке сигнатур +
+                    # SABR → "Only images available". JS-free клиенты (android_vr/ios) это
+                    # обходят, НО yt-dlp запрещает их при наличии аккаунт-кук → поэтому для
+                    # YouTube куки НЕ передаём (публичным видео они не нужны; наши всё равно
+                    # протухшие). EJS с github не тянем (блэкхол).
+                    ydl_opts['cookiefile'] = None
+                    ydl_opts['extractor_args'] = {
+                        'youtube': {'player_client': ['android_vr', 'ios', 'android']},
+                        'pornhub': {'no_js': True},
+                    }
+                    ydl_opts.pop('remote_components', None)
+
                 # Добавляем или ПРИНУДИТЕЛЬНО ОТКЛЮЧАЕМ прокси
                 if use_proxy and SOCKS_PROXY:
                     ydl_opts['proxy'] = SOCKS_PROXY
@@ -714,10 +728,22 @@ async def _download_local_ytdlp(url: str, is_music: bool = False, video_height: 
                         else:
                             ydl_opts['format'] = 'bestvideo+bestaudio/best'
                     elif video_height:
-                        ydl_opts['format'] = f"best[height={video_height}]/best[height<={video_height}]/best"
+                        # Мёржим раздельные DASH-потоки (у YouTube комбинированных
+                        # форматов почти нет). Приоритет avc1+m4a → чистый mp4 для Telegram.
+                        ydl_opts['merge_output_format'] = 'mp4'
+                        ydl_opts['format'] = (
+                            f"bestvideo[height<={video_height}][vcodec^=avc1]+bestaudio[ext=m4a]/"
+                            f"bestvideo[height<={video_height}]+bestaudio/"
+                            f"best[height<={video_height}]/best"
+                        )
                     else:
-                        # Видео с H.264 кодеком
-                        ydl_opts['format'] = 'best[vcodec^=h264]/best[vcodec^=avc]/best'
+                        # Видео с H.264 кодеком, тоже с merge-фолбэком на раздельные потоки
+                        ydl_opts['merge_output_format'] = 'mp4'
+                        ydl_opts['format'] = (
+                            "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/"
+                            "bestvideo+bestaudio/"
+                            "best[vcodec^=h264]/best"
+                        )
                 
                 try:
                     info, prepared_name = await asyncio.to_thread(_run_ytdlp_extract, ydl_opts, url)
